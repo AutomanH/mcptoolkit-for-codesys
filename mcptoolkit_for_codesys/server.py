@@ -26,7 +26,13 @@ from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListToolsResult,
+    TextContent,
+    Tool,
+)
 
 from .ipc import IpcClient, IpcTimeout
 from .watcher_manager import (
@@ -37,7 +43,7 @@ from .watcher_manager import (
 from .tools import REGISTRY, ToolContext, error_envelope
 
 
-log = logging.getLogger("mcptoolkit_for_codesys")
+log = logging.getLogger("mcptoolkit-for-codesys")
 
 
 def _default_workdir() -> Path:
@@ -94,17 +100,15 @@ async def _serve(args: argparse.Namespace) -> None:
     ipc = IpcClient(workdir=args.workdir)
     ctx = ToolContext(ipc=ipc, install=install, manager=manager)
 
-    server = Server("mcptoolkit-for-codesys")
+    async def list_tools(_ctx, _params) -> ListToolsResult:
+        return ListToolsResult(tools=[spec.to_mcp_tool() for spec in REGISTRY.specs()])
 
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        return [spec.to_mcp_tool() for spec in REGISTRY.specs()]
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    async def call_tool(_ctx, params: CallToolRequestParams) -> CallToolResult:
+        name = params.name
+        arguments = params.arguments
         spec = REGISTRY.get(name)
         if spec is None:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+            return CallToolResult(content=[TextContent(type="text", text=f"Unknown tool: {name}")])
         try:
             await manager.ensure_started()
             payload = await spec.handler(ctx, arguments or {})
@@ -115,7 +119,7 @@ async def _serve(args: argparse.Namespace) -> None:
             # recovery on the next call.
             diag = manager.diagnose_hang()
             log.warning("tool %s timed out; hang diagnosis: %s", name, diag)
-            return [TextContent(type="text", text=error_envelope(
+            return CallToolResult(content=[TextContent(type="text", text=error_envelope(
                 "IpcTimeout", str(exc),
                 hang_diagnosis=diag,
                 advice=(
@@ -124,14 +128,16 @@ async def _serve(args: argparse.Namespace) -> None:
                     "guard auto-confirms safe prompts; a hung watcher is "
                     "killed and respawned on the next call. Retry shortly."
                 ),
-            ))]
+            ))])
         except Exception as exc:  # noqa: BLE001 — surface all failures to the LLM
             log.exception("tool %s failed", name)
-            return [TextContent(type="text", text=error_envelope(
+            return CallToolResult(content=[TextContent(type="text", text=error_envelope(
                 type(exc).__name__, str(exc),
                 advice="Host-side tool error. See the message; retry or adjust arguments.",
-            ))]
-        return [TextContent(type="text", text=payload)]
+            ))])
+        return CallToolResult(content=[TextContent(type="text", text=payload)])
+
+    server = Server("mcptoolkit-for-codesys", on_list_tools=list_tools, on_call_tool=call_tool)
 
     # Background guard: auto-confirm the watcher's own modal dialogs (storage
     # upgrade, save prompts) so a scripted op never wedges waiting for a click.
